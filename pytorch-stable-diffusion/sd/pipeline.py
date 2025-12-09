@@ -2,6 +2,7 @@ import torch
 import numpy as np
 from tqdm import tqdm
 from ddpm import DDPMSampler
+from sd.Calice.ddim import DDIMSampler
 
 WIDTH = 512
 HEIGHT = 512
@@ -74,6 +75,9 @@ def generate(
 
         if sampler_name == "ddpm":
             sampler = DDPMSampler(generator)
+            sampler.set_inference_timesteps(n_inference_steps)
+        elif sampler_name == "ddim":
+            sampler = DDIMSampler(generator)
             sampler.set_inference_timesteps(n_inference_steps)
         else:
             raise ValueError("Unknown sampler value %s. ")
