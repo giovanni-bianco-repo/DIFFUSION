@@ -4,12 +4,19 @@ from torch.nn import functional as F
 import math
 
 class SelfAttention(nn.Module):
-    def __init__(self, n_heads, d_embed, in_proj_bias=True, out_proj_bias=True):
+    def __init__(self, n_heads, d_embed, in_proj_bias=True, out_proj_bias=True, use_lora=False, lora_rank=4, lora_alpha=1.0):
         super().__init__()
+        self.use_lora = use_lora
+        
         # This combines the Wq, Wk and Wv matrices into one matrix
-        self.in_proj = nn.Linear(d_embed, 3 * d_embed, bias=in_proj_bias)
-        # This one represents the Wo matrix
-        self.out_proj = nn.Linear(d_embed, d_embed, bias=out_proj_bias)
+        if use_lora:
+            from lora import LoRALinear
+            self.in_proj = LoRALinear(d_embed, 3 * d_embed, bias=in_proj_bias, rank=lora_rank, alpha=lora_alpha)
+            self.out_proj = LoRALinear(d_embed, d_embed, bias=out_proj_bias, rank=lora_rank, alpha=lora_alpha)
+        else:
+            self.in_proj = nn.Linear(d_embed, 3 * d_embed, bias=in_proj_bias)
+            self.out_proj = nn.Linear(d_embed, d_embed, bias=out_proj_bias)
+        
         self.n_heads = n_heads
         self.d_head = d_embed // n_heads
 
@@ -65,12 +72,22 @@ class SelfAttention(nn.Module):
         return output
 
 class CrossAttention(nn.Module):
-    def __init__(self, n_heads, d_embed, d_cross, in_proj_bias=True, out_proj_bias=True):
+    def __init__(self, n_heads, d_embed, d_cross, in_proj_bias=True, out_proj_bias=True, use_lora=False, lora_rank=4, lora_alpha=1.0):
         super().__init__()
-        self.q_proj   = nn.Linear(d_embed, d_embed, bias=in_proj_bias)
-        self.k_proj   = nn.Linear(d_cross, d_embed, bias=in_proj_bias)
-        self.v_proj   = nn.Linear(d_cross, d_embed, bias=in_proj_bias)
-        self.out_proj = nn.Linear(d_embed, d_embed, bias=out_proj_bias)
+        self.use_lora = use_lora
+        
+        if use_lora:
+            from lora import LoRALinear
+            self.q_proj   = LoRALinear(d_embed, d_embed, bias=in_proj_bias, rank=lora_rank, alpha=lora_alpha)
+            self.k_proj   = LoRALinear(d_cross, d_embed, bias=in_proj_bias, rank=lora_rank, alpha=lora_alpha)
+            self.v_proj   = LoRALinear(d_cross, d_embed, bias=in_proj_bias, rank=lora_rank, alpha=lora_alpha)
+            self.out_proj = LoRALinear(d_embed, d_embed, bias=out_proj_bias, rank=lora_rank, alpha=lora_alpha)
+        else:
+            self.q_proj   = nn.Linear(d_embed, d_embed, bias=in_proj_bias)
+            self.k_proj   = nn.Linear(d_cross, d_embed, bias=in_proj_bias)
+            self.v_proj   = nn.Linear(d_cross, d_embed, bias=in_proj_bias)
+            self.out_proj = nn.Linear(d_embed, d_embed, bias=out_proj_bias)
+        
         self.n_heads = n_heads
         self.d_head = d_embed // n_heads
     
