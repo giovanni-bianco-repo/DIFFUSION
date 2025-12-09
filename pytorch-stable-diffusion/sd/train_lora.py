@@ -5,12 +5,13 @@ LoRA Training Script for Stable Diffusion
 - Prepares data for training
 - Sets up model with LoRA
 - Trains only LoRA parameters
-- Saves LoRA weights
+- Saves LoRA weights compatible with pipeline.generate
 """
 
 import os
 import torch
 from torch.utils.data import Dataset, DataLoader
+from transformers import CLIPTokenizer
 from torchvision import transforms
 from PIL import Image
 from model_loader import preload_models_with_lora, save_models_lora
@@ -66,8 +67,45 @@ def train_lora(
     lora_dropout=0.0,
     device=None
 ):
+    # Device selection logic
     if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = "cpu"
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif (hasattr(torch, "has_mps") and torch.has_mps) or (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
+            device = "mps"
+    print(f"Using device: {device}")
+
+    # Tokenizer
+    tokenizer = CLIPTokenizer("../data/vocab.json", merges_file="../data/merges.txt")
+
+    # Load base model and apply LoRA
+    models = preload_models_with_lora(ckpt_path, device, lora_rank=lora_rank, lora_alpha=lora_alpha, lora_dropout=lora_dropout)
+
+    # Prepare dataset and dataloader
+    dataset = StyleDataset(image_dir, captions_file, tokenizer, device)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+    # Training loop
+    lora_params = get_lora_parameters(models)
+    optimizer = torch.optim.Adam(lora_params, lr=lr)
+
+    for epoch in range(epochs):
+        models["unet"].train()
+        for batch in dataloader:
+            images, captions = batch
+            images = images.to(device)
+            captions = captions.to(device)
+            optimizer.zero_grad()
+            # Forward pass (customize as needed for your pipeline)
+            loss = models["unet"].forward(images, captions)
+            loss.backward()
+            optimizer.step()
+        print(f"Epoch {epoch+1}/{epochs} completed.")
+
+    # Save LoRA weights in a format compatible with pipeline.generate
+    save_models_lora(models, output_path)
+    print(f"LoRA weights saved to {output_path}")
     print(f"Using device: {device}")
 
     # Dataset and DataLoader
