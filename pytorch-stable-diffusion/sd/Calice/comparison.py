@@ -1,6 +1,11 @@
 import os
+import sys
 import torch
 import matplotlib.pyplot as plt
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+sys.path.append(parent_dir)
 from PIL import Image
 from transformers import CLIPTokenizer
 import model_loader
@@ -16,25 +21,25 @@ elif (torch.has_mps or torch.backends.mps.is_available()) and ALLOW_MPS:
     DEVICE = "mps"
 print(f"Using device: {DEVICE}")
 
-vocab_path = "/data/vocab.json"
-merges_path = "/data/merges.txt"
-model_ckpt_path = "/data/v1-5-pruned-emaonly.ckpt"
+vocab_path = "/Users/pai/Desktop/DIFFUSION/pytorch-stable-diffusion/data/vocab.json"
+merges_path = "/Users/pai/Desktop/DIFFUSION/pytorch-stable-diffusion/data/merges.txt"
+model_ckpt_path = "/Users/pai/Desktop/DIFFUSION/pytorch-stable-diffusion/data/v1-5-pruned-emaonly.ckpt"
 
 tokenizer = CLIPTokenizer(vocab_path, merges_file=merges_path)
 models = model_loader.preload_models_from_standard_weights(model_ckpt_path, DEVICE)
-print("模型加载完成！")
 
-steps_list = [2,5,7,15,20,50]
-samplers = ["ddim","ddpm"]
+steps_list = [100]
+samplers = ["dpm","ddim","ddpm"]
 fixed_seed = 42
-prompt = "A futuristic white architectural building, Zaha Hadid style, curved glass facade, blue sky background, minimal, clean lines, sunny day, architectural photography, ultra sharp."
+prompt = "Hyper-realistic close-up portrait of an elderly viking warrior, deep wrinkles, weathered skin, detailed white beard, intense blue eyes, dramatic side lighting, Rembrandt lighting, 8k resolution, cinematic, raw photo, sharp focus."
 
 output_dir = "/Users/pai/Desktop/NNDL"
 os.makedirs(output_dir, exist_ok=True)
 
 results = {
     "ddpm": {},
-    "ddim": {}
+    "ddim": {},
+    "dpm": {}
 }
 
 
