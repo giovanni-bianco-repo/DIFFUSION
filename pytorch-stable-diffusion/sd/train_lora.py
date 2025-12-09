@@ -50,7 +50,7 @@ def encode_text(clip_model, tokenizer, captions, device):
     # Assumes CLIP model has encode_text method
     tokens = tokenizer(captions, padding=True, return_tensors="pt").to(device)
     with torch.no_grad():
-        text_embeds = clip_model.encode_text(tokens.input_ids)
+        text_embeds = clip_model(tokens.input_ids)
     return text_embeds
 
 # --- 3. Training Loop ---
