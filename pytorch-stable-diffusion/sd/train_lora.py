@@ -76,14 +76,14 @@ def train_lora(
             device = "mps"
     print(f"Using device: {device}")
 
-    # Tokenizer
-    tokenizer = CLIPTokenizer("../data/vocab.json", merges_file="../data/merges.txt")
+    # Tokenizer (use local vocab/merges files)
+    tokenizer = CLIPTokenizer("data/vocab.json", merges_file="data/merges.txt")
 
     # Load base model and apply LoRA
     models = preload_models_with_lora(ckpt_path, device, lora_rank=lora_rank, lora_alpha=lora_alpha, lora_dropout=lora_dropout)
 
     # Prepare dataset and dataloader
-    dataset = StyleDataset(image_dir, captions_file, tokenizer, device)
+    dataset = StyleDataset(image_dir, captions_file)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
     # Training loop
@@ -103,9 +103,12 @@ def train_lora(
             optimizer.step()
         print(f"Epoch {epoch+1}/{epochs} completed.")
 
-    # Save LoRA weights in a format compatible with pipeline.generate
+    # Explicitly move all models to CUDA before saving LoRA weights
+    if device == "cuda":
+        for model in models.values():
+            model.to("cuda")
     save_models_lora(models, output_path)
-    print(f"LoRA weights saved to {output_path}")
+    print(f"LoRA weights saved to {output_path} (saved from {device})")
     print(f"Using device: {device}")
 
     # Dataset and DataLoader
@@ -125,9 +128,7 @@ def train_lora(
     diffusion = models['diffusion']
     clip = models['clip']
 
-    # Tokenizer for CLIP
-    from transformers import CLIPTokenizer
-    tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch16")
+    # Remove duplicate import and initialization of CLIPTokenizer
 
     # Only train LoRA parameters
     for param in diffusion.parameters():
