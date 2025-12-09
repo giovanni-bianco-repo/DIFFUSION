@@ -1,10 +1,7 @@
-numpy==1.26.4
-torch==2.2.2
-torchvision==0.17.2   # if you used it before
-torchaudio==2.2.2     # optional
 
-tqdm==4.67.1
-transformers==4.49.0
-
-pytorch-lightning==2.4.0
-pillow==10.4.0
+torch==2.0.1
+numpy==1.25.0
+tqdm==4.65.0
+transformers==4.57.3
+lightning==2.0.9
+pillow==9.5.0
