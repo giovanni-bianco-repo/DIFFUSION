@@ -187,19 +187,31 @@ def get_lora_parameters(model: nn.Module):
 
 def save_lora_weights(model: nn.Module, path: str):
     """
-    Save only the LoRA weights (not the full model).
-    This creates a small checkpoint file containing only the LoRA adaptations.
+    Save LoRA weights, keeping the 'unet.' prefix but removing 'diffusion.'.
+    This makes the checkpoint compatible between training and inference.
     """
     lora_state_dict = {}
+
     for name, module in model.named_modules():
-        if isinstance(module, (LoRALayer, LoRALinear)) and hasattr(module, 'lora_A'):
-            lora_state_dict[f"{name}.lora_A"] = module.lora_A.data
-            lora_state_dict[f"{name}.lora_B"] = module.lora_B.data
-            lora_state_dict[f"{name}.alpha"] = module.alpha
-            lora_state_dict[f"{name}.rank"] = module.rank
-    
+        if isinstance(module, (LoRALayer, LoRALinear)) and hasattr(module, "lora_A"):
+
+            clean_name = name
+
+            # Remove ONLY the "diffusion." prefix
+            if clean_name.startswith("diffusion."):
+                clean_name = clean_name[len("diffusion."):]
+
+            # KEEP "unet." prefix
+            # So "diffusion.unet.xxx" becomes "unet.xxx"
+            # And "unet.xxx" remains "unet.xxx"
+
+            lora_state_dict[f"{clean_name}.lora_A"] = module.lora_A.data.cpu()
+            lora_state_dict[f"{clean_name}.lora_B"] = module.lora_B.data.cpu()
+            lora_state_dict[f"{clean_name}.alpha"] = module.alpha
+            lora_state_dict[f"{clean_name}.rank"] = module.rank
+
     torch.save(lora_state_dict, path)
-    print(f"Saved LoRA weights to {path} ({len(lora_state_dict)} parameters)")
+    print(f"[LoRA Saved] -> {path}, entries: {len(lora_state_dict)}")
 
 
 def load_lora_weights(model: nn.Module, path: str):
@@ -207,23 +219,23 @@ def load_lora_weights(model: nn.Module, path: str):
     Load LoRA weights into a model.
     """
     lora_state_dict = torch.load(path)
-    
-    for name, module in model.named_modules():
+    for name, module in model['diffusion'].named_modules():
         if isinstance(module, (LoRALayer, LoRALinear)):
-            lora_a_key = f"{name}.lora_A"
-            lora_b_key = f"{name}.lora_B"
-            
+            lora_a_key = f"diffusion.{name}.lora_A"
+            lora_b_key = f"diffusion.{name}.lora_B"
             if lora_a_key in lora_state_dict:
                 module.lora_A.data = lora_state_dict[lora_a_key]
                 module.lora_B.data = lora_state_dict[lora_b_key]
-                if f"{name}.alpha" in lora_state_dict:
-                    module.alpha = lora_state_dict[f"{name}.alpha"]
-                if f"{name}.rank" in lora_state_dict:
-                    module.rank = lora_state_dict[f"{name}.rank"]
+                if f"diffusion.{name}.alpha" in lora_state_dict:
+                    module.alpha = lora_state_dict[f"diffusion.{name}.alpha"]
+                    print("alpha worked")
+                if f"diffusion.{name}.rank" in lora_state_dict:
+                    module.rank = lora_state_dict[f"diffusion.{name}.rank"]
+                    print("rank worked")
                     module.scaling = module.alpha / module.rank
     
     print(f"Loaded LoRA weights from {path}")
-
+    return model
 
 def merge_lora_weights(model: nn.Module):
     """
