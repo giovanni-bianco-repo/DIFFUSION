@@ -85,7 +85,6 @@ def load_lora_into_models(models, lora_path):
         models: Dictionary of models (from preload_models_with_lora)
         lora_path: Path to the LoRA checkpoint file
     """
-    import torch
     lora_state_dict = torch.load(lora_path)
     
     # Load LoRA weights for each model
