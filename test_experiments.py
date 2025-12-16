@@ -3,6 +3,14 @@
 Comprehensive testing script for Textual Inversion experiments.
 Generates images with base model and all trained models, computes metrics,
 and creates visualizations showing how performance scales with dataset size.
+
+Extended version with:
+- Overfitting index (style - text similarity)
+- LPIPS perceptual distance to training images
+- Subject preservation score
+- Failure rate
+- Prompt embedding drift
+- All previous metrics (CLIP text similarity, style consistency, diversity, quality)
 """
 
 import os
@@ -22,9 +30,10 @@ from torchvision import transforms
 import clip
 from diffusers import StableDiffusionPipeline
 from transformers import CLIPProcessor, CLIPModel
+import lpips  # NEW
 
 
-# Test prompts
+# Test prompts (with placeholder style token)
 TEST_PROMPTS = [
     "a small red airplane flying over mountains in <style1> style",
     "three people walking on a busy city stret in <style1> style",
@@ -36,6 +45,13 @@ BASE_PROMPTS = [
     "a small red airplane flying over mountains in style1 style",
     "three people walking on a busy city stret in style1 style",
     "a cute cat sitting on a wooden table in style1 style",
+]
+
+# Subject-only prompts (no style wording at all) for subject preservation metric
+SUBJECT_PROMPTS = [
+    "a small red airplane flying over mountains",
+    "three people walking on a busy city street",
+    "a cute cat sitting on a wooden table",
 ]
 
 
@@ -59,11 +75,19 @@ class MetricsCalculator:
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
+
+        # LPIPS model for perceptual distance (optional)
+        try:
+            print("Loading LPIPS model for perceptual distance...")
+            self.lpips_model = lpips.LPIPS(net="vgg").to(device)
+        except Exception as e:
+            print(f"Warning: could not initialize LPIPS model: {e}")
+            self.lpips_model = None
     
     def clip_text_similarity(self, image, text):
         """
         Calculate CLIP similarity between image and text prompt.
-        Higher is better (range: 0-1, typically 0.2-0.35 for good matches).
+        Higher is better (range: ~0.2-0.35 for good matches).
         """
         image_input = self.clip_preprocess(image).unsqueeze(0).to(self.device)
         text_input = clip.tokenize([text]).to(self.device)
@@ -86,8 +110,6 @@ class MetricsCalculator:
         Returns average cosine similarity with training images.
         """
         # Get generated image features
-        gen_img = self.transform(generated_image).unsqueeze(0).to(self.device)
-        
         with torch.no_grad():
             gen_inputs = self.clip_processor(images=generated_image, return_tensors="pt").to(self.device)
             gen_features = self.clip_feature_model.get_image_features(**gen_inputs)
@@ -117,6 +139,42 @@ class MetricsCalculator:
                 continue
         
         return np.mean(similarities) if similarities else 0.0
+
+    def lpips_distance_to_training(self, generated_image, training_images_dir):
+        """
+        LPIPS perceptual distance between generated image and training images.
+        Lower is better. Returns mean LPIPS distance.
+        """
+        if self.lpips_model is None or not os.path.exists(training_images_dir):
+            return np.nan
+
+        # LPIPS expects tensors in [-1, 1]
+        def to_lpips_tensor(img: Image.Image):
+            t = transforms.ToTensor()(img).unsqueeze(0).to(self.device)  # [0,1]
+            t = t * 2 - 1  # [-1,1]
+            return t
+
+        gen_t = to_lpips_tensor(generated_image)
+
+        training_images = [
+            f for f in os.listdir(training_images_dir)
+            if f.lower().endswith(('.jpg', '.jpeg', '.png'))
+        ]
+
+        distances = []
+        for img_file in training_images[:20]:
+            img_path = os.path.join(training_images_dir, img_file)
+            try:
+                train_img = Image.open(img_path).convert('RGB')
+                train_t = to_lpips_tensor(train_img)
+                with torch.no_grad():
+                    d = self.lpips_model(gen_t, train_t).item()
+                distances.append(d)
+            except Exception as e:
+                print(f"Warning: Could not compute LPIPS for {img_file}: {e}")
+                continue
+
+        return np.mean(distances) if distances else np.nan
     
     def calculate_diversity(self, images):
         """
@@ -226,23 +284,33 @@ def generate_images_for_model(
 
 def compute_metrics_for_images(
     images_dict,
-    prompts,
+    eval_prompts,
     training_data_dir,
     metrics_calculator,
     model_name,
+    subject_prompts=None,
+    prompt_embedding_drift=None,
+    failure_clip_threshold=0.1,
 ):
     """
     Compute all metrics for generated images.
-    
+
     Returns:
-        Dictionary with aggregated metrics
+        List of per-image metric dicts.
     """
     all_metrics = []
     
     for prompt_idx, (prompt, images) in enumerate(images_dict.items()):
-        # Text-to-style prompt for CLIP (remove placeholder token for evaluation)
-        eval_prompt = prompts[prompt_idx] if isinstance(prompts, list) else prompt
-        
+        # Text prompt for evaluation (without placeholder token etc.)
+        eval_prompt = eval_prompts[prompt_idx] if isinstance(eval_prompts, list) else eval_prompts
+        subj_prompt = None
+        if subject_prompts is not None and isinstance(subject_prompts, list):
+            if prompt_idx < len(subject_prompts):
+                subj_prompt = subject_prompts[prompt_idx]
+
+        # Precompute diversity for this prompt
+        diversity = metrics_calculator.calculate_diversity(images)
+
         for img_idx, image in enumerate(images):
             metrics = {
                 'model': model_name,
@@ -251,30 +319,100 @@ def compute_metrics_for_images(
                 'image_idx': img_idx,
             }
             
-            # CLIP text similarity
-            metrics['clip_text_similarity'] = metrics_calculator.clip_text_similarity(
+            # CLIP text similarity (prompt adherence)
+            text_sim = metrics_calculator.clip_text_similarity(
                 image, eval_prompt
             )
+            metrics['clip_text_similarity'] = text_sim
             
             # Style consistency with training data
             if training_data_dir and os.path.exists(training_data_dir):
-                metrics['style_consistency'] = metrics_calculator.style_consistency_with_training_data(
+                style_sim = metrics_calculator.style_consistency_with_training_data(
                     image, training_data_dir
                 )
             else:
-                metrics['style_consistency'] = 0.0
-            
+                style_sim = 0.0
+            metrics['style_consistency'] = style_sim
+
+            # Overfitting index = style - text
+            metrics['overfit_index'] = style_sim - text_sim
+
+            # Subject preservation score
+            if subj_prompt is not None:
+                subj_sim = metrics_calculator.clip_text_similarity(image, subj_prompt)
+            else:
+                subj_sim = np.nan
+            metrics['subject_preservation'] = subj_sim
+
+            # LPIPS perceptual distance to training set
+            if training_data_dir and os.path.exists(training_data_dir):
+                lpips_dist = metrics_calculator.lpips_distance_to_training(
+                    image, training_data_dir
+                )
+            else:
+                lpips_dist = np.nan
+            metrics['lpips_distance'] = lpips_dist
+
             # Image quality
             metrics['image_quality'] = metrics_calculator.image_quality_score(image)
             
+            # Diversity for this prompt (same value for all images of that prompt)
+            metrics['diversity'] = diversity
+
+            # Prompt embedding drift (model-level, constant per model)
+            metrics['prompt_embedding_drift'] = (
+                float(prompt_embedding_drift) if prompt_embedding_drift is not None else np.nan
+            )
+
+            # Failure flag (simple CLIP-based rule)
+            metrics['failure'] = int(metrics['clip_text_similarity'] < failure_clip_threshold)
+            
             all_metrics.append(metrics)
-        
-        # Calculate diversity for this prompt
-        diversity = metrics_calculator.calculate_diversity(images)
-        for m in all_metrics[-len(images):]:
-            m['diversity'] = diversity
     
     return all_metrics
+
+
+def compute_prompt_embedding_drift(pipeline, subject_prompts, style_token="<style1>"):
+    """
+    Compute prompt embedding drift between plain subject prompts and
+    subject prompts with the style token appended.
+
+    Returns a single scalar (mean L2 distance across prompts).
+    """
+    if not hasattr(pipeline, "tokenizer") or not hasattr(pipeline, "text_encoder"):
+        return np.nan
+
+    tokenizer = pipeline.tokenizer
+    text_encoder = pipeline.text_encoder
+
+    distances = []
+
+    with torch.no_grad():
+        for subj in subject_prompts:
+            base_ids = tokenizer(
+                subj,
+                return_tensors="pt",
+                truncation=True,
+                padding="max_length",
+                max_length=tokenizer.model_max_length,
+            ).input_ids.to(pipeline.device)
+
+            styled_text = f"{subj} in {style_token} style"
+            styled_ids = tokenizer(
+                styled_text,
+                return_tensors="pt",
+                truncation=True,
+                padding="max_length",
+                max_length=tokenizer.model_max_length,
+            ).input_ids.to(pipeline.device)
+
+            base_emb = text_encoder(base_ids)[0].mean(dim=1)
+            styled_emb = text_encoder(styled_ids)[0].mean(dim=1)
+
+            dist = torch.norm(base_emb - styled_emb, p=2).item()
+            distances.append(dist)
+
+    return float(np.mean(distances)) if distances else np.nan
 
 
 def create_visualizations(results_df, output_dir):
@@ -293,7 +431,11 @@ def create_visualizations(results_df, output_dir):
         parts = model_name.split('_')
         for part in parts:
             if 'imgs' in part:
-                return int(part.replace('imgs', ''))
+                # expects patterns like "8imgs"
+                try:
+                    return int(part.replace('imgs', ''))
+                except ValueError:
+                    continue
         return 0
     
     results_df['num_training_images'] = results_df['model'].apply(get_num_images)
@@ -302,16 +444,26 @@ def create_visualizations(results_df, output_dir):
     model_metrics = results_df.groupby(['model', 'num_training_images']).agg({
         'clip_text_similarity': ['mean', 'std'],
         'style_consistency': ['mean', 'std'],
+        'overfit_index': ['mean', 'std'],
+        'subject_preservation': ['mean', 'std'],
+        'lpips_distance': ['mean', 'std'],
         'image_quality': ['mean', 'std'],
         'diversity': 'mean',
+        'failure': 'mean',
+        'prompt_embedding_drift': 'mean',
     }).reset_index()
     
     model_metrics.columns = [
         'model', 'num_training_images',
         'clip_text_similarity_mean', 'clip_text_similarity_std',
         'style_consistency_mean', 'style_consistency_std',
+        'overfit_index_mean', 'overfit_index_std',
+        'subject_preservation_mean', 'subject_preservation_std',
+        'lpips_distance_mean', 'lpips_distance_std',
         'image_quality_mean', 'image_quality_std',
-        'diversity_mean'
+        'diversity_mean',
+        'failure_rate',
+        'prompt_embedding_drift_mean',
     ]
     
     # Sort by number of training images
@@ -399,8 +551,10 @@ def create_visualizations(results_df, output_dir):
         
         ax.bar(range(len(data)), data[metric], color=color, alpha=0.7)
         ax.set_xticks(range(len(data)))
-        ax.set_xticklabels([f"{int(n)} imgs" if n > 0 else "base" for n in data['num_training_images']], 
-                           rotation=45, ha='right')
+        ax.set_xticklabels(
+            [f"{int(n)} imgs" if n > 0 else "base" for n in data['num_training_images']], 
+            rotation=45, ha='right'
+        )
         ax.set_ylabel('Score', fontsize=11)
         ax.set_title(title, fontsize=12, fontweight='bold')
         ax.grid(True, alpha=0.3, axis='y')
@@ -507,6 +661,8 @@ def main():
             None,  # No training data for base model
             metrics_calc,
             "base_model",
+            subject_prompts=SUBJECT_PROMPTS,
+            prompt_embedding_drift=np.nan,  # we can leave drift undefined for base
         )
         all_results.extend(base_metrics)
         
@@ -547,14 +703,23 @@ def main():
                 seed=args.seed,
             )
             
+            # Compute prompt embedding drift for this model
+            try:
+                drift = compute_prompt_embedding_drift(trained_pipe, SUBJECT_PROMPTS, style_token="<style1>")
+            except Exception as e:
+                print(f"Warning: could not compute prompt embedding drift for {exp_name}: {e}")
+                drift = np.nan
+            
             # Compute metrics
             print(f"\nComputing metrics for {exp_name}...")
             trained_metrics = compute_metrics_for_images(
                 trained_images,
-                BASE_PROMPTS,  # Use base prompts for evaluation
+                BASE_PROMPTS,  # Use base prompts for evaluation semantics
                 data_dir,
                 metrics_calc,
                 exp_name,
+                subject_prompts=SUBJECT_PROMPTS,
+                prompt_embedding_drift=drift,
             )
             all_results.extend(trained_metrics)
             
@@ -592,8 +757,13 @@ def main():
     summary = results_df.groupby('model').agg({
         'clip_text_similarity': ['mean', 'std'],
         'style_consistency': ['mean', 'std'],
+        'overfit_index': ['mean', 'std'],
+        'subject_preservation': ['mean', 'std'],
+        'lpips_distance': ['mean', 'std'],
         'image_quality': ['mean', 'std'],
         'diversity': 'mean',
+        'failure': 'mean',
+        'prompt_embedding_drift': 'mean',
     }).round(4)
     
     print("\n", summary)
