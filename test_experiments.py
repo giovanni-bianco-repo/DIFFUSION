@@ -11,6 +11,9 @@ Extended version with:
 - Failure rate
 - Prompt embedding drift
 - All previous metrics (CLIP text similarity, style consistency, diversity, quality)
+
+Modified to:
+- Detect censored / black safety images and skip them so they are not counted in metrics.
 """
 
 import os
@@ -30,29 +33,43 @@ from torchvision import transforms
 import clip
 from diffusers import StableDiffusionPipeline
 from transformers import CLIPProcessor, CLIPModel
-import lpips  # NEW
+import lpips
 
 
-# Test prompts (with placeholder style token)
+# Test prompts (with placeholder style token, used for generation for ALL models)
 TEST_PROMPTS = [
     "a small red airplane flying over mountains in <style1> style",
-    "three people walking on a busy city stret in <style1> style",
-    "a cute cat sitting on a wooden table in <style1> style",
+    "three people walking on a busy city street in <style1> style",
+    "a cute cat sitting on a table in <style1> style, harmless, no sexal",
 ]
 
-# Corresponding prompts for base model (without placeholder token)
+# Corresponding prompts for evaluation (no placeholder token, real style name)
 BASE_PROMPTS = [
-    "a small red airplane flying over mountains in style1 style",
-    "three people walking on a busy city stret in style1 style",
-    "a cute cat sitting on a wooden table in style1 style",
+    "a small red airplane flying over mountains in impressionism style",
+    "three people walking on a busy city street in impressionism style",
+    "a cute cat sitting on a table in impressionism style",
 ]
 
 # Subject-only prompts (no style wording at all) for subject preservation metric
 SUBJECT_PROMPTS = [
     "a small red airplane flying over mountains",
     "three people walking on a busy city street",
-    "a cute cat sitting on a wooden table",
+    "a cute cat sitting on a table",
 ]
+
+
+def is_safety_black_image(image, mean_threshold=10, std_threshold=10):
+    """
+    Detects images that are essentially 'black' / blank as produced by safety filters.
+
+    Uses grayscale statistics:
+    - Very low mean intensity (dark)
+    - Very low standard deviation (little variation)
+
+    Tune thresholds if needed.
+    """
+    arr = np.array(image.convert("L"))
+    return arr.mean() < mean_threshold and arr.std() < std_threshold
 
 
 class MetricsCalculator:
@@ -69,11 +86,17 @@ class MetricsCalculator:
         self.clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
         self.clip_feature_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
         
-        # Image transform for style consistency
+        # Image transform for style consistency (CLIP image embeddings)
         self.transform = transforms.Compose([
             transforms.Resize((224, 224)),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+
+        # Transform for LPIPS (resize + [0,1] to [-1,1], fixed spatial size)
+        self.lpips_transform = transforms.Compose([
+            transforms.Resize((256, 256)),
+            transforms.ToTensor(),  # [0,1]
         ])
 
         # LPIPS model for perceptual distance (optional)
@@ -148,12 +171,15 @@ class MetricsCalculator:
         if self.lpips_model is None or not os.path.exists(training_images_dir):
             return np.nan
 
-        # LPIPS expects tensors in [-1, 1]
+        # LPIPS expects tensors in [-1, 1] with matching H×W
         def to_lpips_tensor(img: Image.Image):
-            t = transforms.ToTensor()(img).unsqueeze(0).to(self.device)  # [0,1]
-            t = t * 2 - 1  # [-1,1]
+            # Resize to fixed resolution and convert to tensor in [0,1]
+            t = self.lpips_transform(img).unsqueeze(0).to(self.device)
+            # Map to [-1,1]
+            t = t * 2 - 1
             return t
 
+        # Generated image (resized to 256×256)
         gen_t = to_lpips_tensor(generated_image)
 
         training_images = [
@@ -166,10 +192,12 @@ class MetricsCalculator:
             img_path = os.path.join(training_images_dir, img_file)
             try:
                 train_img = Image.open(img_path).convert('RGB')
-                train_t = to_lpips_tensor(train_img)
+                train_t = to_lpips_tensor(train_img)  # also 256×256
+
                 with torch.no_grad():
                     d = self.lpips_model(gen_t, train_t).item()
                 distances.append(d)
+
             except Exception as e:
                 print(f"Warning: Could not compute LPIPS for {img_file}: {e}")
                 continue
@@ -242,10 +270,12 @@ def generate_images_for_model(
     output_dir,
     model_name,
     num_images_per_prompt=5,
-    seed=42,
+    seed=1,
 ):
     """
     Generate images using a given pipeline for all prompts.
+
+    Censored / black safety images are detected and skipped (not saved, not returned).
     
     Returns:
         Dictionary mapping prompt to list of generated images
@@ -269,9 +299,25 @@ def generate_images_for_model(
                 generator=generator,
             )
             image = output.images[0]
+
+            # Check NSFW flag from the pipeline (if present)
+            is_nsfw = False
+            if hasattr(output, "nsfw_content_detected") and output.nsfw_content_detected is not None:
+                try:
+                    is_nsfw = bool(output.nsfw_content_detected[0])
+                except Exception:
+                    try:
+                        is_nsfw = any(bool(x) for x in output.nsfw_content_detected)
+                    except Exception:
+                        is_nsfw = False
+
+            # Check for black/blank safety image
+            if is_nsfw or is_safety_black_image(image):
+                print(f"    Skipping censored/black image for prompt {prompt_idx}, idx {img_idx}")
+                continue
             
-            # Save image
-            filename = f"{model_name}_prompt{prompt_idx}_img{img_idx}.png"
+            # Save only valid images
+            filename = f"{model_name}_prompt{prompt_idx}_img{len(images)}.png"
             filepath = os.path.join(output_dir, filename)
             image.save(filepath)
             
@@ -295,12 +341,22 @@ def compute_metrics_for_images(
     """
     Compute all metrics for generated images.
 
+    Any remaining safety-black images are filtered out before metrics,
+    so they do not contribute to the statistics.
+
     Returns:
         List of per-image metric dicts.
     """
     all_metrics = []
     
     for prompt_idx, (prompt, images) in enumerate(images_dict.items()):
+        # Filter out safety-black images defensively (in case some slipped through or came from disk)
+        valid_images = [img for img in images if not is_safety_black_image(img)]
+
+        if not valid_images:
+            print(f"  No valid (non-black) images for prompt {prompt_idx}, skipping metrics for this prompt.")
+            continue
+
         # Text prompt for evaluation (without placeholder token etc.)
         eval_prompt = eval_prompts[prompt_idx] if isinstance(eval_prompts, list) else eval_prompts
         subj_prompt = None
@@ -309,9 +365,9 @@ def compute_metrics_for_images(
                 subj_prompt = subject_prompts[prompt_idx]
 
         # Precompute diversity for this prompt
-        diversity = metrics_calculator.calculate_diversity(images)
+        diversity = metrics_calculator.calculate_diversity(valid_images)
 
-        for img_idx, image in enumerate(images):
+        for img_idx, image in enumerate(valid_images):
             metrics = {
                 'model': model_name,
                 'prompt_idx': prompt_idx,
@@ -469,7 +525,7 @@ def create_visualizations(results_df, output_dir):
     # Sort by number of training images
     model_metrics = model_metrics.sort_values('num_training_images')
     
-    # Create subplots
+    # ===== FIGURE 1: original 4 curves =====
     fig, axes = plt.subplots(2, 2, figsize=(16, 12))
     fig.suptitle('Textual Inversion Performance vs Dataset Size', fontsize=16, fontweight='bold')
     
@@ -493,7 +549,7 @@ def create_visualizations(results_df, output_dir):
         trained_models['num_training_images'],
         trained_models['style_consistency_mean'],
         yerr=trained_models['style_consistency_std'],
-        marker='s', linewidth=2, markersize=8, capsize=5, color='green'
+        marker='s', linewidth=2, markersize=8, capsize=5
     )
     ax.set_xlabel('Number of Training Images', fontsize=12)
     ax.set_ylabel('Style Consistency Score', fontsize=12)
@@ -506,7 +562,7 @@ def create_visualizations(results_df, output_dir):
         model_metrics['num_training_images'],
         model_metrics['image_quality_mean'],
         yerr=model_metrics['image_quality_std'],
-        marker='^', linewidth=2, markersize=8, capsize=5, color='orange'
+        marker='^', linewidth=2, markersize=8, capsize=5
     )
     ax.set_xlabel('Number of Training Images', fontsize=12)
     ax.set_ylabel('Image Quality Score', fontsize=12)
@@ -518,7 +574,7 @@ def create_visualizations(results_df, output_dir):
     ax.plot(
         model_metrics['num_training_images'],
         model_metrics['diversity_mean'],
-        marker='D', linewidth=2, markersize=8, color='purple'
+        marker='D', linewidth=2, markersize=8
     )
     ax.set_xlabel('Number of Training Images', fontsize=12)
     ax.set_ylabel('Diversity Score', fontsize=12)
@@ -527,29 +583,91 @@ def create_visualizations(results_df, output_dir):
     
     plt.tight_layout()
     
-    # Save plot
     plot_path = os.path.join(output_dir, 'metrics_vs_dataset_size.png')
     plt.savefig(plot_path, dpi=300, bbox_inches='tight')
     print(f"\nSaved metrics plot: {plot_path}")
     
-    # Create a detailed comparison plot
+    # ===== FIGURE 2: extra metrics vs dataset size =====
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    fig.suptitle('Additional Metrics vs Dataset Size', fontsize=16, fontweight='bold')
+    
+    # Overfitting index
+    ax = axes[0, 0]
+    ax.errorbar(
+        trained_models['num_training_images'],
+        trained_models['overfit_index_mean'],
+        yerr=trained_models['overfit_index_std'],
+        marker='o', linewidth=2, markersize=8, capsize=5
+    )
+    ax.set_xlabel('Number of Training Images', fontsize=12)
+    ax.set_ylabel('Overfitting Index (style - text)', fontsize=12)
+    ax.set_title('Overfitting vs Dataset Size', fontsize=13, fontweight='bold')
+    ax.grid(True, alpha=0.3)
+    
+    # LPIPS distance
+    ax = axes[0, 1]
+    ax.errorbar(
+        trained_models['num_training_images'],
+        trained_models['lpips_distance_mean'],
+        yerr=trained_models['lpips_distance_std'],
+        marker='s', linewidth=2, markersize=8, capsize=5
+    )
+    ax.set_xlabel('Number of Training Images', fontsize=12)
+    ax.set_ylabel('LPIPS Distance to Training Set', fontsize=12)
+    ax.set_title('Perceptual Distance vs Dataset Size', fontsize=13, fontweight='bold')
+    ax.grid(True, alpha=0.3)
+    
+    # Subject preservation
+    ax = axes[1, 0]
+    ax.errorbar(
+        trained_models['num_training_images'],
+        trained_models['subject_preservation_mean'],
+        yerr=trained_models['subject_preservation_std'],
+        marker='^', linewidth=2, markersize=8, capsize=5
+    )
+    ax.set_xlabel('Number of Training Images', fontsize=12)
+    ax.set_ylabel('Subject Preservation (CLIP)', fontsize=12)
+    ax.set_title('Semantic Preservation vs Dataset Size', fontsize=13, fontweight='bold')
+    ax.grid(True, alpha=0.3)
+    
+    # Failure rate
+    ax = axes[1, 1]
+    ax.plot(
+        trained_models['num_training_images'],
+        trained_models['failure_rate'],
+        marker='D', linewidth=2, markersize=8
+    )
+    ax.set_xlabel('Number of Training Images', fontsize=12)
+    ax.set_ylabel('Failure Rate', fontsize=12)
+    ax.set_title('Failure Rate vs Dataset Size', fontsize=13, fontweight='bold')
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    extra_plot_path = os.path.join(output_dir, 'extra_metrics_vs_dataset_size.png')
+    plt.savefig(extra_plot_path, dpi=300, bbox_inches='tight')
+    print(f"Saved extra metrics plot: {extra_plot_path}")
+    
+    plt.close('all')
+    
+    # ===== BAR PLOT SUMMARY =====
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
     fig.suptitle('Detailed Metrics Comparison Across All Models', fontsize=16, fontweight='bold')
     
     metrics_to_plot = [
-        ('clip_text_similarity_mean', 'CLIP Text Similarity', 'blue'),
-        ('style_consistency_mean', 'Style Consistency', 'green'),
-        ('image_quality_mean', 'Image Quality', 'orange'),
+        ('clip_text_similarity_mean', 'CLIP Text Similarity'),
+        ('style_consistency_mean', 'Style Consistency'),
+        ('image_quality_mean', 'Image Quality'),
     ]
     
-    for idx, (metric, title, color) in enumerate(metrics_to_plot):
+    for idx, (metric, title) in enumerate(metrics_to_plot):
         ax = axes[idx]
         if metric == 'style_consistency_mean':
             data = model_metrics[model_metrics['num_training_images'] > 0]
         else:
             data = model_metrics
         
-        ax.bar(range(len(data)), data[metric], color=color, alpha=0.7)
+        ax.bar(range(len(data)), data[metric], alpha=0.7)
         ax.set_xticks(range(len(data)))
         ax.set_xticklabels(
             [f"{int(n)} imgs" if n > 0 else "base" for n in data['num_training_images']], 
@@ -561,12 +679,9 @@ def create_visualizations(results_df, output_dir):
     
     plt.tight_layout()
     
-    # Save detailed plot
     detailed_plot_path = os.path.join(output_dir, 'detailed_metrics_comparison.png')
     plt.savefig(detailed_plot_path, dpi=300, bbox_inches='tight')
     print(f"Saved detailed comparison plot: {detailed_plot_path}")
-    
-    plt.close('all')
     
     # Save model metrics table
     metrics_table_path = os.path.join(output_dir, 'model_metrics_summary.csv')
@@ -605,7 +720,7 @@ def main():
     parser.add_argument(
         "--seed",
         type=int,
-        default=42,
+        default=1,
         help="Random seed for reproducibility",
     )
     parser.add_argument(
@@ -633,7 +748,7 @@ def main():
     all_results = []
     
     if not args.skip_generation:
-        # Generate images with base model
+        # Generate images with base model (NOW USING TEST_PROMPTS with <style1>)
         print("\n" + "="*80)
         print("TESTING BASE MODEL")
         print("="*80)
@@ -646,14 +761,14 @@ def main():
         base_output_dir = os.path.join(args.output_dir, "images", "base_model")
         base_images = generate_images_for_model(
             base_pipe,
-            BASE_PROMPTS,
+            TEST_PROMPTS,  # <-- use generation prompts with <style1>
             base_output_dir,
             "base_model",
             num_images_per_prompt=args.num_images_per_prompt,
             seed=args.seed,
         )
         
-        # Compute metrics for base model
+        # Compute metrics for base model (CLIP text uses impressionism prompts)
         print("\nComputing metrics for base model...")
         base_metrics = compute_metrics_for_images(
             base_images,
@@ -668,7 +783,8 @@ def main():
         
         # Clean up base model
         del base_pipe
-        torch.cuda.empty_cache()
+        if device == "cuda":
+            torch.cuda.empty_cache()
         
         # Test each trained model
         for exp in experiments_info['experiments']:
@@ -692,7 +808,7 @@ def main():
                 print(f"Error loading model {exp_name}: {e}")
                 continue
             
-            # Generate images
+            # Generate images (also using TEST_PROMPTS with <style1>)
             model_output_dir = os.path.join(args.output_dir, "images", exp_name)
             trained_images = generate_images_for_model(
                 trained_pipe,
@@ -710,11 +826,11 @@ def main():
                 print(f"Warning: could not compute prompt embedding drift for {exp_name}: {e}")
                 drift = np.nan
             
-            # Compute metrics
+            # Compute metrics (CLIP text uses impressionism prompts)
             print(f"\nComputing metrics for {exp_name}...")
             trained_metrics = compute_metrics_for_images(
                 trained_images,
-                BASE_PROMPTS,  # Use base prompts for evaluation semantics
+                BASE_PROMPTS,  # Use impressionism prompts for evaluation semantics
                 data_dir,
                 metrics_calc,
                 exp_name,
@@ -725,7 +841,8 @@ def main():
             
             # Clean up
             del trained_pipe
-            torch.cuda.empty_cache()
+            if device == "cuda":
+                torch.cuda.empty_cache()
     
         # Save all metrics
         results_df = pd.DataFrame(all_results)
