@@ -4,7 +4,7 @@ from PIL import Image
 import clip
 
 # Paths
-trained_dir = "./style1-output"
+trained_dir = "experiments_results/TI_impressionism_2imgs_150steps/model"
 standard_model = "runwayml/stable-diffusion-v1-5"
 
 # Prompts

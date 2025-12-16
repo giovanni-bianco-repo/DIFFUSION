@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # Textual Inversion Training Script for Style Embedding
 # This script is based on the DigitalOcean tutorial and adapted for style training.
 
@@ -5,6 +6,8 @@ import os
 import math
 import itertools
 import random
+import argparse
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -13,17 +16,15 @@ from PIL import Image
 from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import CLIPTokenizer, CLIPTextModel, CLIPFeatureExtractor
-from diffusers import AutoencoderKL, UNet2DConditionModel, StableDiffusionPipeline, DDPMScheduler, PNDMScheduler
+from diffusers import (
+    AutoencoderKL,
+    UNet2DConditionModel,
+    StableDiffusionPipeline,
+    DDPMScheduler,
+    PNDMScheduler,
+)
 from diffusers.pipelines.stable_diffusion import StableDiffusionSafetyChecker
 from accelerate import Accelerator
-
-# --- Settings ---
-pretrained_model_name_or_path = "runwayml/stable-diffusion-v1-5"  # or local path
-save_path = "./inputs_textual_inversion_preprocessed/style1"
-placeholder_token = "<style1>"
-initializer_token = "painting"  # a word that represents your style
-what_to_teach = "style"  # "object" or "style"
-output_dir = "./style1-output"
 
 # --- Prompt templates (style) ---
 imagenet_style_templates_small = [
@@ -48,9 +49,22 @@ imagenet_style_templates_small = [
     "a large painting in the style of {}",
 ]
 
+
 # --- Dataset class ---
 class TextualInversionDataset(Dataset):
-    def __init__(self, data_root, tokenizer, learnable_property="style", size=512, repeats=100, interpolation="bicubic", flip_p=0.5, set="train", placeholder_token="*", center_crop=False):
+    def __init__(
+        self,
+        data_root,
+        tokenizer,
+        learnable_property="style",
+        size=512,
+        repeats=100,
+        interpolation="bicubic",
+        flip_p=0.5,
+        set="train",
+        placeholder_token="*",
+        center_crop=False,
+    ):
         self.data_root = data_root
         self.tokenizer = tokenizer
         self.learnable_property = learnable_property
@@ -58,26 +72,40 @@ class TextualInversionDataset(Dataset):
         self.placeholder_token = placeholder_token
         self.center_crop = center_crop
         self.flip_p = flip_p
-        self.image_paths = [os.path.join(self.data_root, file_path) for file_path in os.listdir(self.data_root)]
+
+        self.image_paths = [
+            os.path.join(self.data_root, file_path)
+            for file_path in os.listdir(self.data_root)
+        ]
         self.num_images = len(self.image_paths)
         self._length = self.num_images * repeats if set == "train" else self.num_images
+
         self.interpolation = {
             "linear": Image.BILINEAR,  # LINEAR is deprecated, use BILINEAR
             "bilinear": Image.BILINEAR,
             "bicubic": Image.BICUBIC,
             "lanczos": Image.LANCZOS,
         }[interpolation]
-        self.templates = imagenet_style_templates_small if learnable_property == "style" else []
+
+        self.templates = (
+            imagenet_style_templates_small
+            if learnable_property == "style"
+            else []
+        )
         self.flip_transform = transforms.RandomHorizontalFlip(p=self.flip_p)
+
     def __len__(self):
         return self._length
+
     def __getitem__(self, i):
         example = {}
         image = Image.open(self.image_paths[i % self.num_images])
         if not image.mode == "RGB":
             image = image.convert("RGB")
+
         placeholder_string = self.placeholder_token
         text = random.choice(self.templates).format(placeholder_string)
+
         example["input_ids"] = self.tokenizer(
             text,
             padding="max_length",
@@ -85,11 +113,17 @@ class TextualInversionDataset(Dataset):
             max_length=self.tokenizer.model_max_length,
             return_tensors="pt",
         ).input_ids[0]
+
         img = np.array(image).astype(np.uint8)
+
         if self.center_crop:
             crop = min(img.shape[0], img.shape[1])
             h, w = img.shape[0], img.shape[1]
-            img = img[(h - crop) // 2 : (h + crop) // 2, (w - crop) // 2 : (w + crop) // 2]
+            img = img[
+                (h - crop) // 2 : (h + crop) // 2,
+                (w - crop) // 2 : (w + crop) // 2,
+            ]
+
         image = Image.fromarray(img)
         image = image.resize((self.size, self.size), resample=self.interpolation)
         image = self.flip_transform(image)
@@ -98,30 +132,60 @@ class TextualInversionDataset(Dataset):
         example["pixel_values"] = torch.from_numpy(image).permute(2, 0, 1)
         return example
 
+
 # --- Training function ---
-def training_function():
+def training_function(args):
+    # Unpack args
+    pretrained_model_name_or_path = args.pretrained_model_name_or_path
+    data_root = args.data_root
+    output_dir = args.output_dir
+    placeholder_token = args.placeholder_token
+    initializer_token = args.initializer_token
+    what_to_teach = args.what_to_teach
+    learning_rate = args.learning_rate
+    max_train_steps = args.max_train_steps
+    repeats = args.repeats
+    image_size = args.image_size
+    train_batch_size = args.train_batch_size
+
     # Load tokenizer and add placeholder token
-    tokenizer = CLIPTokenizer.from_pretrained(pretrained_model_name_or_path, subfolder="tokenizer")
+    tokenizer = CLIPTokenizer.from_pretrained(
+        pretrained_model_name_or_path, subfolder="tokenizer"
+    )
     num_added_tokens = tokenizer.add_tokens(placeholder_token)
     if num_added_tokens == 0:
-        raise ValueError(f"The tokenizer already contains the token {placeholder_token}. Please use a different placeholder_token.")
+        raise ValueError(
+            f"The tokenizer already contains the token {placeholder_token}. "
+            f"Please use a different placeholder_token."
+        )
+
     # Get token ids
     token_ids = tokenizer.encode(initializer_token, add_special_tokens=False)
     if len(token_ids) > 1:
         raise ValueError("The initializer token must be a single token.")
     initializer_token_id = token_ids[0]
     placeholder_token_id = tokenizer.convert_tokens_to_ids(placeholder_token)
+
     # Load models
-    text_encoder = CLIPTextModel.from_pretrained(pretrained_model_name_or_path, subfolder="text_encoder")
-    vae = AutoencoderKL.from_pretrained(pretrained_model_name_or_path, subfolder="vae")
-    unet = UNet2DConditionModel.from_pretrained(pretrained_model_name_or_path, subfolder="unet")
+    text_encoder = CLIPTextModel.from_pretrained(
+        pretrained_model_name_or_path, subfolder="text_encoder"
+    )
+    vae = AutoencoderKL.from_pretrained(
+        pretrained_model_name_or_path, subfolder="vae"
+    )
+    unet = UNet2DConditionModel.from_pretrained(
+        pretrained_model_name_or_path, subfolder="unet"
+    )
+
     text_encoder.resize_token_embeddings(len(tokenizer))
     token_embeds = text_encoder.get_input_embeddings().weight.data
     token_embeds[placeholder_token_id] = token_embeds[initializer_token_id]
+
     # Freeze all except new embedding
     def freeze_params(params):
         for param in params:
             param.requires_grad = False
+
     freeze_params(vae.parameters())
     freeze_params(unet.parameters())
     params_to_freeze = itertools.chain(
@@ -130,60 +194,108 @@ def training_function():
         text_encoder.text_model.embeddings.position_embedding.parameters(),
     )
     freeze_params(params_to_freeze)
+
     # Dataset and dataloader
     train_dataset = TextualInversionDataset(
-        data_root=save_path,
+        data_root=data_root,
         tokenizer=tokenizer,
-        size=512,
+        size=image_size,
         placeholder_token=placeholder_token,
-        repeats=100,
+        repeats=repeats,
         learnable_property=what_to_teach,
         center_crop=False,
         set="train",
     )
-    train_dataloader = DataLoader(train_dataset, batch_size=1, shuffle=True)
+    train_dataloader = DataLoader(
+        train_dataset,
+        batch_size=train_batch_size,
+        shuffle=True,
+    )
+
     # Scheduler and optimizer
-    noise_scheduler = DDPMScheduler(beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", num_train_timesteps=1000)
-    learning_rate = 5e-4
-    max_train_steps = 1000
+    noise_scheduler = DDPMScheduler(
+        beta_start=0.00085,
+        beta_end=0.012,
+        beta_schedule="scaled_linear",
+        num_train_timesteps=1000,
+    )
+
     accelerator = Accelerator()
-    optimizer = torch.optim.AdamW(text_encoder.get_input_embeddings().parameters(), lr=learning_rate)
-    text_encoder, optimizer, train_dataloader = accelerator.prepare(text_encoder, optimizer, train_dataloader)
+    optimizer = torch.optim.AdamW(
+        text_encoder.get_input_embeddings().parameters(),
+        lr=learning_rate,
+    )
+
+    text_encoder, optimizer, train_dataloader = accelerator.prepare(
+        text_encoder, optimizer, train_dataloader
+    )
     vae.to(accelerator.device)
     unet.to(accelerator.device)
     vae.eval()
     unet.eval()
-    progress_bar = tqdm(range(max_train_steps), disable=not accelerator.is_local_main_process)
+
+    progress_bar = tqdm(
+        range(max_train_steps),
+        disable=not accelerator.is_local_main_process,
+    )
     global_step = 0
+
     for step, batch in enumerate(train_dataloader):
         if global_step >= max_train_steps:
             break
+
         text_encoder.train()
         with accelerator.accumulate(text_encoder):
             latents = vae.encode(batch["pixel_values"]).latent_dist.sample().detach()
             latents = latents * 0.18215
+
             noise = torch.randn(latents.shape).to(latents.device)
             bsz = latents.shape[0]
-            timesteps = torch.randint(0, noise_scheduler.num_train_timesteps, (bsz,), device=latents.device).long()
+            timesteps = torch.randint(
+                0,
+                noise_scheduler.num_train_timesteps,
+                (bsz,),
+                device=latents.device,
+            ).long()
+
             noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
             encoder_hidden_states = text_encoder(batch["input_ids"])[0]
-            noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
-            loss = F.mse_loss(noise_pred, noise, reduction="none").mean([1, 2, 3]).mean()
+            noise_pred = unet(
+                noisy_latents, timesteps, encoder_hidden_states
+            ).sample
+
+            loss = F.mse_loss(
+                noise_pred,
+                noise,
+                reduction="none",
+            ).mean([1, 2, 3]).mean()
+
             accelerator.backward(loss)
+
             if accelerator.num_processes > 1:
-                grads = text_encoder.module.get_input_embeddings().weight.grad
+                grads = (
+                    text_encoder.module.get_input_embeddings().weight.grad
+                )
             else:
                 grads = text_encoder.get_input_embeddings().weight.grad
+
             index_grads_to_zero = torch.arange(len(tokenizer)) != placeholder_token_id
-            grads.data[index_grads_to_zero, :] = grads.data[index_grads_to_zero, :].fill_(0)
+            grads.data[index_grads_to_zero, :] = grads.data[
+                index_grads_to_zero, :
+            ].fill_(0)
+
             optimizer.step()
             optimizer.zero_grad()
+
         if accelerator.sync_gradients:
             progress_bar.update(1)
             global_step += 1
+
         if global_step >= max_train_steps:
             break
+
     accelerator.wait_for_everyone()
+
     # Save pipeline and embedding
     if accelerator.is_main_process:
         pipeline = StableDiffusionPipeline(
@@ -191,15 +303,101 @@ def training_function():
             vae=vae,
             unet=unet,
             tokenizer=tokenizer,
-            scheduler=PNDMScheduler(beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", skip_prk_steps=True),
-            safety_checker=StableDiffusionSafetyChecker.from_pretrained("CompVis/stable-diffusion-safety-checker"),
-            feature_extractor=CLIPFeatureExtractor.from_pretrained("openai/clip-vit-base-patch32"),
+            scheduler=PNDMScheduler(
+                beta_start=0.00085,
+                beta_end=0.012,
+                beta_schedule="scaled_linear",
+                skip_prk_steps=True,
+            ),
+            safety_checker=StableDiffusionSafetyChecker.from_pretrained(
+                "CompVis/stable-diffusion-safety-checker"
+            ),
+            feature_extractor=CLIPFeatureExtractor.from_pretrained(
+                "openai/clip-vit-base-patch32"
+            ),
         )
+        os.makedirs(output_dir, exist_ok=True)
         pipeline.save_pretrained(output_dir)
-        learned_embeds = accelerator.unwrap_model(text_encoder).get_input_embeddings().weight[placeholder_token_id]
+
+        learned_embeds = (
+            accelerator.unwrap_model(text_encoder)
+            .get_input_embeddings()
+            .weight[placeholder_token_id]
+        )
         learned_embeds_dict = {placeholder_token: learned_embeds.detach().cpu()}
-        torch.save(learned_embeds_dict, os.path.join(output_dir, "learned_embeds.bin"))
+        torch.save(
+            learned_embeds_dict,
+            os.path.join(output_dir, "learned_embeds.bin"),
+        )
+
     print(f"Training complete. Embedding and pipeline saved to {output_dir}")
 
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Train a textual inversion style embedding."
+    )
+    parser.add_argument(
+        "--pretrained_model_name_or_path",
+        type=str,
+        default="runwayml/stable-diffusion-v1-5",
+    )
+    parser.add_argument(
+        "--data_root",
+        type=str,
+        default="./inputs_textual_inversion_preprocessed/style1",
+        help="Directory with training images",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="./style1-output",
+        help="Where to save the trained embedding and pipeline",
+    )
+    parser.add_argument(
+        "--placeholder_token",
+        type=str,
+        default="<style1>",
+    )
+    parser.add_argument(
+        "--initializer_token",
+        type=str,
+        default="painting",
+    )
+    parser.add_argument(
+        "--what_to_teach",
+        type=str,
+        default="style",
+        choices=["style", "object"],
+    )
+    parser.add_argument(
+        "--learning_rate",
+        type=float,
+        default=5e-4,
+    )
+    parser.add_argument(
+        "--max_train_steps",
+        type=int,
+        default=1000,
+    )
+    parser.add_argument(
+        "--repeats",
+        type=int,
+        default=100,
+    )
+    parser.add_argument(
+        "--image_size",
+        type=int,
+        default=512,
+    )
+    parser.add_argument(
+        "--train_batch_size",
+        type=int,
+        default=1,
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    training_function()
+    args = parse_args()
+    training_function(args)
